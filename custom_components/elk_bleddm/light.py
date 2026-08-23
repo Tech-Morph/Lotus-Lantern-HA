@@ -4,15 +4,25 @@ Handles connection through Home Assistant's Bluetooth integration
 (including ESPHome Bluetooth proxies) via bleak-retry-connector, and
 writes the exact byte protocol reverse engineered from the Lotus
 Lantern Android app.
+
+v0.3: adds an asyncio.Lock around all connect+write operations. Without
+it, the keep-alive timer and a real command (or two rapid commands)
+could race to open a second connection to the same address at the same
+time, which causes the proxy to thrash: repeated "Connecting v3 without
+cache" / "Connection request ignored, state: CONNECTING" / "GetServices
+mid-stream, restarting" cycles, followed by GATT write errors
+(status=129/143) once a write lands on a connection that's mid-reset.
 """
 
 from __future__ import annotations
 
+import asyncio
+import datetime
 import logging
 from typing import Any
 
-from bleak import BleakClient
 from bleak.backends.device import BLEDevice
+from bleak.exc import BleakError
 from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
 
 from homeassistant.components import bluetooth
@@ -25,8 +35,9 @@ from homeassistant.components.light import (
     LightEntityFeature,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_time_interval
 
 from .const import (
     DOMAIN,
@@ -43,6 +54,18 @@ _LOGGER = logging.getLogger(__name__)
 
 EFFECT_NAME_TO_ID = {v: k for k, v in EFFECT_NAMES.items()}
 
+# Send a harmless no-op (re-assert current power state) this often to keep
+# the GATT link alive. Tune down if your strip still drops; tune up if you
+# want to free the proxy's connection slot more aggressively between uses.
+KEEP_ALIVE_INTERVAL = datetime.timedelta(seconds=25)
+
+# How many times bleak-retry-connector retries a single connect attempt.
+MAX_CONNECT_ATTEMPTS = 5
+
+# Brief settle time after a fresh connection before the first write, to
+# avoid racing GATT service discovery / MTU negotiation on the proxy.
+POST_CONNECT_SETTLE_SECONDS = 0.3
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -52,11 +75,12 @@ async def async_setup_entry(
     """Set up the light platform from a config entry."""
     address: str = entry.data["address"]
     name: str = entry.data.get("name", "ELK-BLEDDM Light")
-    async_add_entities([ElkBleddmLight(hass, address, name, entry.entry_id)])
+    entity = ElkBleddmLight(hass, address, name, entry.entry_id)
+    async_add_entities([entity])
 
 
 class ElkBleddmLight(LightEntity):
-    """Representation of an ELK-BLEDDM BLE light strip."""
+    """Representation of an ELK-BLEDDM BLE light strip with a serialized, persistent connection."""
 
     _attr_has_entity_name = True
     _attr_name = None
@@ -82,6 +106,10 @@ class ElkBleddmLight(LightEntity):
         self._brightness = 255
         self._rgb_color = (255, 255, 255)
         self._effect: str | None = None
+        self._unsub_keep_alive = None
+        # Serializes every connect + write so the keep-alive timer and real
+        # commands never race each other into opening a second connection.
+        self._ble_lock = asyncio.Lock()
 
     @property
     def is_on(self) -> bool:
@@ -108,8 +136,16 @@ class ElkBleddmLight(LightEntity):
             is not None
         )
 
-    async def _ensure_connected(self) -> BleakClientWithServiceCache:
-        """Connect (or reuse an existing connection) via HA's Bluetooth stack."""
+    def _on_unexpected_disconnect(self, client: BleakClientWithServiceCache) -> None:
+        """Called by bleak-retry-connector if the device drops the link on its own."""
+        _LOGGER.warning(
+            "ELK-BLEDDM %s disconnected unexpectedly; will reconnect on next write",
+            self._address,
+        )
+        self._client = None
+
+    async def _ensure_connected_locked(self) -> BleakClientWithServiceCache:
+        """Connect (or reuse an existing connection). Caller must hold self._ble_lock."""
         if self._client is not None and self._client.is_connected:
             return self._client
 
@@ -122,13 +158,70 @@ class ElkBleddmLight(LightEntity):
             )
 
         self._client = await establish_connection(
-            BleakClientWithServiceCache, ble_device, self._address
+            BleakClientWithServiceCache,
+            ble_device,
+            self._address,
+            disconnected_callback=self._on_unexpected_disconnect,
+            max_attempts=MAX_CONNECT_ATTEMPTS,
         )
+        _LOGGER.debug("ELK-BLEDDM %s connected, settling before first write", self._address)
+        await asyncio.sleep(POST_CONNECT_SETTLE_SECONDS)
         return self._client
 
-    async def _write(self, payload: bytearray) -> None:
-        client = await self._ensure_connected()
-        await client.write_gatt_char(WRITE_CHARACTERISTIC_UUID, payload, response=False)
+    async def _write(self, payload: bytearray, retry: bool = True) -> None:
+        async with self._ble_lock:
+            try:
+                client = await self._ensure_connected_locked()
+                await client.write_gatt_char(
+                    WRITE_CHARACTERISTIC_UUID, payload, response=False
+                )
+            except BleakError as err:
+                self._client = None
+                if not retry:
+                    raise
+                _LOGGER.debug(
+                    "ELK-BLEDDM %s write failed (%s), reconnecting once",
+                    self._address,
+                    err,
+                )
+                # Retry once, still inside the lock so nothing else can race in.
+                client = await self._ensure_connected_locked()
+                await client.write_gatt_char(
+                    WRITE_CHARACTERISTIC_UUID, payload, response=False
+                )
+
+    async def _keep_alive_tick(self, _now) -> None:
+        """Periodic no-op write to stop the link (or proxy slot) from idling out.
+
+        Skips itself (rather than blocking) if a real command already holds
+        the lock, so keep-alive traffic never queues up behind, or races
+        against, a user-triggered action.
+        """
+        if not self._is_on:
+            # Don't bother keeping a connection open for a light that's off;
+            # let it drop and reconnect on the next command instead. This
+            # also frees the proxy's limited connection slots for other
+            # devices while this light isn't actively in use.
+            return
+        if self._ble_lock.locked():
+            return
+        async with self._ble_lock:
+            try:
+                client = await self._ensure_connected_locked()
+                await client.write_gatt_char(
+                    WRITE_CHARACTERISTIC_UUID, cmd_power(True), response=False
+                )
+            except BleakError:
+                self._client = None
+                _LOGGER.debug(
+                    "ELK-BLEDDM %s keep-alive failed, will retry next tick",
+                    self._address,
+                )
+
+    async def async_added_to_hass(self) -> None:
+        self._unsub_keep_alive = async_track_time_interval(
+            self._hass, self._keep_alive_tick, KEEP_ALIVE_INTERVAL
+        )
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         await self._write(cmd_power(True))
@@ -161,5 +254,9 @@ class ElkBleddmLight(LightEntity):
         await self._write(cmd_effect_speed(speed))
 
     async def async_will_remove_from_hass(self) -> None:
-        if self._client is not None and self._client.is_connected:
-            await self._client.disconnect()
+        if self._unsub_keep_alive is not None:
+            self._unsub_keep_alive()
+            self._unsub_keep_alive = None
+        async with self._ble_lock:
+            if self._client is not None and self._client.is_connected:
+                await self._client.disconnect()
