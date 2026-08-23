@@ -1,0 +1,7 @@
+{
+  "name": "ELK-BLEDDM Lotus Lantern Light",
+  "content_in_root": false,
+  "render_readme": true,
+  "domains": ["light"],
+  "homeassistant": "2024.6.0"
+}
