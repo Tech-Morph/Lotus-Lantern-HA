@@ -5,13 +5,15 @@ Handles connection through Home Assistant's Bluetooth integration
 writes the exact byte protocol reverse engineered from the Lotus
 Lantern Android app.
 
-v0.3: adds an asyncio.Lock around all connect+write operations. Without
-it, the keep-alive timer and a real command (or two rapid commands)
-could race to open a second connection to the same address at the same
-time, which causes the proxy to thrash: repeated "Connecting v3 without
-cache" / "Connection request ignored, state: CONNECTING" / "GetServices
-mid-stream, restarting" cycles, followed by GATT write errors
-(status=129/143) once a write lands on a connection that's mid-reset.
+v0.4: `available` now also treats a live, connected BleakClient as
+available, instead of relying solely on recent advertisement sightings.
+The ESP32 proxy stops scanning while a GATT connection is open, so
+advertisement-based availability alone caused the entity to flap to
+"Unavailable" every ~10-15 minutes even while actively connected.
+
+v0.3: adds an asyncio.Lock around all connect+write operations to stop
+the keep-alive timer and real commands from racing into duplicate
+connections (proxy thrashing / GATT write errors).
 """
 
 from __future__ import annotations
@@ -54,16 +56,8 @@ _LOGGER = logging.getLogger(__name__)
 
 EFFECT_NAME_TO_ID = {v: k for k, v in EFFECT_NAMES.items()}
 
-# Send a harmless no-op (re-assert current power state) this often to keep
-# the GATT link alive. Tune down if your strip still drops; tune up if you
-# want to free the proxy's connection slot more aggressively between uses.
 KEEP_ALIVE_INTERVAL = datetime.timedelta(seconds=25)
-
-# How many times bleak-retry-connector retries a single connect attempt.
 MAX_CONNECT_ATTEMPTS = 5
-
-# Brief settle time after a fresh connection before the first write, to
-# avoid racing GATT service discovery / MTU negotiation on the proxy.
 POST_CONNECT_SETTLE_SECONDS = 0.3
 
 
@@ -107,8 +101,6 @@ class ElkBleddmLight(LightEntity):
         self._rgb_color = (255, 255, 255)
         self._effect: str | None = None
         self._unsub_keep_alive = None
-        # Serializes every connect + write so the keep-alive timer and real
-        # commands never race each other into opening a second connection.
         self._ble_lock = asyncio.Lock()
 
     @property
@@ -129,6 +121,13 @@ class ElkBleddmLight(LightEntity):
 
     @property
     def available(self) -> bool:
+        # If we already hold a live, connected client, we're available
+        # regardless of whether the proxy has seen a fresh advertisement
+        # recently -- the proxy stops scanning while a GATT connection is
+        # open, so advertisement staleness alone is not a reliable signal
+        # once connected.
+        if self._client is not None and self._client.is_connected:
+            return True
         return (
             bluetooth.async_ble_device_from_address(
                 self._hass, self._address, connectable=True
@@ -184,24 +183,14 @@ class ElkBleddmLight(LightEntity):
                     self._address,
                     err,
                 )
-                # Retry once, still inside the lock so nothing else can race in.
                 client = await self._ensure_connected_locked()
                 await client.write_gatt_char(
                     WRITE_CHARACTERISTIC_UUID, payload, response=False
                 )
 
     async def _keep_alive_tick(self, _now) -> None:
-        """Periodic no-op write to stop the link (or proxy slot) from idling out.
-
-        Skips itself (rather than blocking) if a real command already holds
-        the lock, so keep-alive traffic never queues up behind, or races
-        against, a user-triggered action.
-        """
+        """Periodic no-op write to stop the link (or proxy slot) from idling out."""
         if not self._is_on:
-            # Don't bother keeping a connection open for a light that's off;
-            # let it drop and reconnect on the next command instead. This
-            # also frees the proxy's limited connection slots for other
-            # devices while this light isn't actively in use.
             return
         if self._ble_lock.locked():
             return
