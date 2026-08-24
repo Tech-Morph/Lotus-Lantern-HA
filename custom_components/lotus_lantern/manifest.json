@@ -9,7 +9,7 @@
   "issue_tracker": "https://github.com/Tech-Morph/Lotus-Lantern-HA/issues",
   "requirements": ["bleak-retry-connector>=3.4.0"],
   "version": "0.5.0",
-  "icon": "icon.png"
+  "icon": "icon.png",
   "bluetooth": [
     { "local_name": "ELK-BLEDDM*" },
     { "local_name": "ELK-BLEDOM*" },
