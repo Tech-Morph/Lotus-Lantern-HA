@@ -10,64 +10,76 @@ Lotus Lantern Android app (`com.easylink.colorful`, package `wl.smartled`).
 - Uses the **exact** byte layout confirmed from this specific app/firmware
   variant, rather than generic community-maintained protocol guesses.
 - Adds support for modes the stock `elkbledom` integration doesn't expose:
-  effect selection with named effects, effect speed, and a path to add
-  music-reactive color and mic sensitivity as separate services later.
+  named effect selection, effect speed, mic sensitivity, mic on/off, and a
+  music-reactive color toggle.
 - Fully async, uses `bleak-retry-connector` and Home Assistant's Bluetooth
   integration, so it works transparently through an ESPHome Bluetooth
   proxy — no extra proxy configuration needed beyond active-mode discovery.
+- All entities (light, switches, numbers) for a device share a single BLE
+  connection managed by `device.py`, so adding more controls doesn't burn
+  through your proxy's limited connection slots.
 
 ## File Layout
 
 ```
 custom_components/
-  elk_bleddm/
+  lotus_lantern/
     __init__.py
     manifest.json
     const.py
     config_flow.py
+    device.py
     light.py
+    switch.py
+    number.py
     strings.json
 hacs.json
 ```
 
 ## Installing Locally (fastest path)
 
-1. Copy the `custom_components/elk_bleddm/` folder into your HA config
-   directory: `config/custom_components/elk_bleddm/`.
+1. Copy the `custom_components/lotus_lantern/` folder into your HA config
+   directory: `config/custom_components/lotus_lantern/`.
 2. Restart Home Assistant.
 3. Go to **Settings → Devices & Services → Add Integration**, search
-   **"ELK-BLEDDM"**. If your strip advertised recently, it should appear as
-   a discovered device; otherwise you'll get a manual MAC address field.
+   **"Lotus Lantern"**. If your strip advertised recently, it should appear
+   as a discovered device; otherwise you'll get a manual MAC address field.
 
 ## Installing via HACS (as a custom repo)
 
 1. In HACS → Integrations → the "..." menu → **Custom repositories**, add
    `https://github.com/Tech-Morph/Lotus-Lantern-HA`, category "Integration".
-2. Install "ELK-BLEDDM Lotus Lantern Light" from HACS, restart HA, then add
-   it the same way as above.
+2. Install "Lotus Lantern (ELK-BLEDDM) Light" from HACS, restart HA, then
+   add it the same way as above.
 
 ## What's Implemented
 
-- Power on/off
-- RGB color
-- Brightness
-- Named effects list (22 built-in modes decoded from the protocol)
-- `light.turn_on(effect=...)` support via HA's standard effect parameter
+- **Light**: power on/off, RGB color, brightness, named effects list (22
+  built-in modes decoded from the protocol)
+- **Switch — Mic Streaming**: toggles the strip's onboard mic input
+- **Switch — Music Reactive Color**: when on, color commands from the
+  light entity use the music-reactive color variant instead of the plain
+  solid-color command
+- **Number — Mic Sensitivity** (0-255)
+- **Number — Effect Speed** (0-255)
+- **Number — Mic EQ Mode** (0-7, raw index -- named presets unconfirmed)
 
-## What's Stubbed But Not Yet Wired to Entities
+## Persistent Connection Behavior
 
-`const.py` includes builders for music-reactive color, mic on/off, mic
-sensitivity, mic EQ mode, color temperature, timers, and pin-sequence remap
-— all confirmed working byte layouts from the decompiled app. These aren't
-exposed as entities yet; open an issue or PR if you want them added as
-`number`/`switch` platforms.
+All entities share one `ElkBleddmDevice` connection manager per physical
+strip. It keeps a single BLE connection alive with a periodic keep-alive
+write every 25 seconds, uses an `asyncio.Lock` so concurrent commands from
+different entities never race into duplicate connection attempts, and
+treats a live connected client as "available" even when the ESPHome proxy
+has paused scanning to hold the GATT link open.
 
 ## Protocol Reference
 
 All commands follow `7E [len] [cmd] ... EF` framing, written to
 characteristic `0000fff3-0000-1000-8000-00805f9b34fb` on service
-`0000fff0-0000-1000-8000-00805f9b34fb`. See `custom_components/elk_bleddm/const.py`
-for the full byte-level command table with inline docstrings.
+`0000fff0-0000-1000-8000-00805f9b34fb`. See
+`custom_components/lotus_lantern/const.py` for the full byte-level command
+table with inline docstrings.
 
 ## Troubleshooting
 
@@ -80,3 +92,7 @@ for the full byte-level command table with inline docstrings.
 - **Colors look swapped**: some ELK variants wire RGB channels in a
   different physical order. Use `cmd_pin_sequence()` from `const.py` to
   remap channel order if red/blue (or similar) appear swapped.
+- **Connection thrashing / repeated reconnects**: this was fixed by
+  serializing all connect+write operations through `device.py`'s
+  `asyncio.Lock`. If you still see it, check that only one HA instance /
+  proxy is trying to connect to the device at a time.

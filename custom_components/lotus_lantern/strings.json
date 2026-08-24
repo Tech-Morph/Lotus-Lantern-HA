@@ -1,0 +1,18 @@
+{
+  "config": {
+    "step": {
+      "bluetooth_confirm": {
+        "description": "Add {name} to Home Assistant?"
+      },
+      "user": {
+        "description": "Select a discovered Lotus Lantern / ELK-BLEDDM light, or enter its MAC address manually if it wasn't auto-discovered.",
+        "data": {
+          "address": "Bluetooth address"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "Device is already configured"
+    }
+  }
+}
