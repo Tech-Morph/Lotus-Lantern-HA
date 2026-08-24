@@ -1,6 +1,6 @@
 {
   "domain": "lotus_lantern",
-  "name": "Lotus Lantern (ELK-BLEDDM) Light",
+  "name": "Lotus Lantern",
   "codeowners": ["@Tech-Morph"],
   "config_flow": true,
   "dependencies": ["bluetooth_adapters"],
