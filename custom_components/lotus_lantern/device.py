@@ -9,7 +9,6 @@ proxies only support a handful of simultaneous connections.
 from __future__ import annotations
 
 import asyncio
-import datetime
 import logging
 
 from bleak.backends.device import BLEDevice
@@ -18,13 +17,11 @@ from bleak_retry_connector import BleakClientWithServiceCache, establish_connect
 
 from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.event import async_track_time_interval
 
-from .const import WRITE_CHARACTERISTIC_UUID, cmd_power
+from .const import WRITE_CHARACTERISTIC_UUID
 
 _LOGGER = logging.getLogger(__name__)
 
-KEEP_ALIVE_INTERVAL = datetime.timedelta(seconds=25)
 MAX_CONNECT_ATTEMPTS = 5
 POST_CONNECT_SETTLE_SECONDS = 0.3
 
@@ -37,7 +34,6 @@ class ElkBleddmDevice:
         self.address = address
         self._client: BleakClientWithServiceCache | None = None
         self._lock = asyncio.Lock()
-        self._unsub_keep_alive = None
 
         # Shared state flags, read/written by whichever entity platform
         # cares about them.
@@ -104,32 +100,10 @@ class ElkBleddmDevice:
                     WRITE_CHARACTERISTIC_UUID, payload, response=False
                 )
 
-    async def _keep_alive_tick(self, _now) -> None:
-        if self._lock.locked():
-            return
-        async with self._lock:
-            try:
-                client = await self._ensure_connected_locked()
-                await client.write_gatt_char(
-                    WRITE_CHARACTERISTIC_UUID, cmd_power(self.is_on), response=False
-                )
-            except BleakError:
-                self._client = None
-                _LOGGER.debug(
-                    "Lotus Lantern %s keep-alive failed, will retry next tick",
-                    self.address,
-                )
 
-    def start_keep_alive(self) -> None:
-        if self._unsub_keep_alive is None:
-            self._unsub_keep_alive = async_track_time_interval(
-                self.hass, self._keep_alive_tick, KEEP_ALIVE_INTERVAL
-            )
 
     async def async_shutdown(self) -> None:
-        if self._unsub_keep_alive is not None:
-            self._unsub_keep_alive()
-            self._unsub_keep_alive = None
         async with self._lock:
             if self._client is not None and self._client.is_connected:
                 await self._client.disconnect()
+            self._client = None

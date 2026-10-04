@@ -16,7 +16,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Lotus Lantern from a config entry."""
     hass.data.setdefault(DOMAIN, {})
     device = ElkBleddmDevice(hass, entry.data["address"])
-    device.start_keep_alive()
     hass.data[DOMAIN][entry.entry_id] = device
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
